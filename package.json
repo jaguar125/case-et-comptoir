@@ -13,7 +13,8 @@
     "react-dom": "^18.3.1",
     "lucide-react": "^0.383.0",
     "recharts": "^2.12.7",
-    "tone": "^14.8.49"
+    "tone": "^14.8.49",
+    "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
