@@ -1,9 +1,16 @@
 // src/api.js
 //
-// Client réseau vers le backend Supabase déployé (projet "case-et-comptoir").
-// Gère l'identifiant d'appareil et centralise tous les appels aux Edge Functions.
+// Client réseau + moteur de synchronisation "hors-ligne d'abord".
+// Principe : l'application écrit TOUJOURS en local en premier (jamais bloquée
+// par une coupure réseau). Chaque clé modifiée est marquée "à synchroniser".
+// Dès que la connexion est là, une synchronisation en arrière-plan envoie les
+// changements en attente au serveur, silencieusement.
+
+import bcrypt from "bcryptjs";
 
 const API_BASE = "https://wcpbrejdznoiodspcedn.supabase.co/functions/v1";
+
+/* ---------- Identifiant d'appareil ---------- */
 
 function getDeviceId() {
   let id = localStorage.getItem("device_id");
@@ -14,6 +21,8 @@ function getDeviceId() {
   return id;
 }
 
+/* ---------- Appel réseau de base ---------- */
+
 async function callFunction(name, body) {
   let res;
   try {
@@ -23,30 +32,29 @@ async function callFunction(name, body) {
       body: JSON.stringify(body),
     });
   } catch {
-    throw new Error("Impossible de contacter le serveur. Vérifiez la connexion internet.");
+    throw new Error("OFFLINE");
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Erreur (${name})`);
   return data;
 }
 
-/* ---------- Licence ---------- */
+/* ---------- Licence (inchangé) ---------- */
 
 export async function activateLicense({ code, shopName }) {
   return callFunction("activate", { code, device_id: getDeviceId(), shop_name: shopName });
 }
-
 export async function checkLicense() {
   return callFunction("check", { device_id: getDeviceId() });
 }
 
-/* ---------- Propriétaire (page Abonnement) ---------- */
+/* ---------- Propriétaire (page Abonnement, inchangé) ---------- */
 
 export async function getOwnerShops({ email, secret }) {
   return callFunction("owner-shops", { email, secret });
 }
 
-/* ---------- Boutique partagée (préparé pour la suite) ---------- */
+/* ---------- Liaison boutique <-> appareil ---------- */
 
 function getShopDeviceSecret() { return localStorage.getItem("shop_device_secret"); }
 function setShopDeviceSecret(v) { localStorage.setItem("shop_device_secret", v); }
@@ -57,50 +65,99 @@ export function isShopLinked() {
   return !!(getBackendShopId() && getShopDeviceSecret());
 }
 
-export async function createShopBackend({ name, type, currency, adminPin, vendorName, vendorPin }) {
-  const data = await callFunction("create-shop", {
-    name, type, currency, admin_pin: adminPin,
-    vendor_name: vendorName, vendor_pin: vendorPin,
-    device_id: getDeviceId(),
-  });
+function shopAuthFields() {
+  return { device_id: getDeviceId(), device_secret: getShopDeviceSecret() };
+}
+
+// Crée une boutique côté serveur (device + shop_id uniquement — le contenu
+// réel de la boutique, lui, est poussé ensuite via le moteur de synchro).
+export async function createShopBackend({ name, type, currency }) {
+  const data = await callFunction("create-shop", { name, type, currency, device_id: getDeviceId() });
   setBackendShopId(data.shop_id);
   setShopDeviceSecret(data.device_secret);
-  return data;
+  return data; // { shop_id, join_code, device_secret }
 }
 
 export async function joinShopBackend({ joinCode }) {
   const data = await callFunction("join-shop", { join_code: joinCode, device_id: getDeviceId() });
   setBackendShopId(data.shop_id);
   setShopDeviceSecret(data.device_secret);
-  return data;
+  return data; // { shop_id, device_secret }
 }
 
-function shopAuthFields() {
-  return { device_id: getDeviceId(), device_secret: getShopDeviceSecret() };
+/* ---------- Synchronisation générique (clé/valeur) ---------- */
+
+const ALL_SYNC_KEYS = [
+  "shopMeta", "vendors", "products", "sales", "categories",
+  "suppliers", "expenses", "movements", "inventories", "clients",
+];
+
+function getSyncQueue() {
+  try { return JSON.parse(localStorage.getItem("sync_queue") || "{}"); } catch { return {}; }
+}
+function setSyncQueue(q) {
+  localStorage.setItem("sync_queue", JSON.stringify(q));
+}
+export function markDirty(key) {
+  const q = getSyncQueue();
+  q[key] = true;
+  setSyncQueue(q);
+}
+export function getPendingCount() {
+  return Object.keys(getSyncQueue()).length;
 }
 
-export async function loginBackend({ role, pin }) {
-  return callFunction("auth", { ...shopAuthFields(), role, pin });
+async function pushOne(key, value) {
+  await callFunction("store", { ...shopAuthFields(), action: "set", key, value });
 }
-
-export async function getStoreValue(key) {
+async function pullOne(key) {
   const data = await callFunction("store", { ...shopAuthFields(), action: "get", key });
   return data.value;
 }
-export async function setStoreValue(key, value) {
-  return callFunction("store", { ...shopAuthFields(), action: "set", key, value });
+
+// Tente d'envoyer toutes les clés en attente. Ne jette jamais d'erreur :
+// en cas d'échec (hors-ligne), les clés restent en attente pour la prochaine
+// tentative. `getLocalValue(key)` doit renvoyer la valeur locale actuelle.
+export async function flushSyncQueue(getLocalValue) {
+  if (!isShopLinked()) return { synced: 0, remaining: 0 };
+  const queue = getSyncQueue();
+  const keys = Object.keys(queue);
+  let synced = 0;
+  for (const key of keys) {
+    try {
+      await pushOne(key, getLocalValue(key));
+      delete queue[key];
+      synced += 1;
+      setSyncQueue(queue);
+    } catch {
+      // hors-ligne ou erreur serveur — on réessaiera plus tard
+      break;
+    }
+  }
+  return { synced, remaining: Object.keys(getSyncQueue()).length };
 }
 
-export async function listVendorsBackend(adminPin) {
-  const data = await callFunction("manage-vendors", { ...shopAuthFields(), admin_pin: adminPin, action: "list" });
-  return data.vendors;
+// Récupère l'intégralité des données de la boutique depuis le serveur
+// (utilisé juste après avoir rejoint une boutique existante, ou pour
+// resynchroniser un appareil).
+export async function pullAll() {
+  const result = {};
+  for (const key of ALL_SYNC_KEYS) {
+    try {
+      result[key] = await pullOne(key);
+    } catch {
+      result[key] = undefined; // hors-ligne — on gardera les valeurs locales
+    }
+  }
+  return result;
 }
-export async function createVendorBackend(adminPin, vendor) {
-  return callFunction("manage-vendors", { ...shopAuthFields(), admin_pin: adminPin, action: "create", vendor });
+
+/* ---------- Mots de passe (hachage local, sécurité conservée) ---------- */
+
+export function hashPin(pin) {
+  return bcrypt.hashSync(pin, 8);
 }
-export async function updateVendorBackend(adminPin, vendorId, vendor) {
-  return callFunction("manage-vendors", { ...shopAuthFields(), admin_pin: adminPin, action: "update", vendor_id: vendorId, vendor });
-}
-export async function deleteVendorBackend(adminPin, vendorId) {
-  return callFunction("manage-vendors", { ...shopAuthFields(), admin_pin: adminPin, action: "delete", vendor_id: vendorId });
+export function verifyPin(pin, hash) {
+  if (!hash) return false;
+  try { return bcrypt.compareSync(pin, hash); } catch { return false; }
 }
