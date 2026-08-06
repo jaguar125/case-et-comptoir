@@ -508,8 +508,9 @@ function OnboardingScreen({ shops, onComplete, onJoinShop, pushToast }) {
   const [vendorPin, setVendorPin] = useState("");
   const [currency, setCurrency] = useState("XAF");
   const [joinCode, setJoinCode] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const next = () => {
+  const next = async () => {
     if (step === 1) {
       if (!name.trim()) { pushToast("Indiquez le nom de votre établissement", "error"); return; }
       setStep(2); return;
@@ -518,18 +519,50 @@ function OnboardingScreen({ shops, onComplete, onJoinShop, pushToast }) {
       if (!vendorName.trim() || vendorPin.length !== 4) { pushToast("Nom et code à 4 chiffres requis", "error"); return; }
       setStep(3); return;
     }
-    onComplete(
-      { name: name.trim(), type, currency, joinCode: generateShopJoinCode() },
-      { id: uid(), name: vendorName.trim(), pin: vendorPin }
-    );
+    setLoading(true);
+    try {
+      const backend = await api.createShopBackend({ name: name.trim(), type, currency });
+      const shopObj = {
+        id: backend.shop_id,
+        name: name.trim(), type, currency,
+        joinCode: backend.join_code,
+        backendLinked: true,
+        adminPinHash: api.hashPin(DEFAULT_ADMIN_PIN),
+      };
+      const vendorObj = { id: uid(), name: vendorName.trim(), pinHash: api.hashPin(vendorPin) };
+      onComplete(shopObj, vendorObj);
+    } catch (e) {
+      pushToast(e.message === "OFFLINE" ? "Connexion internet requise pour créer une boutique." : "Erreur lors de la création, réessayez.", "error");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const submitJoin = () => {
+  const submitJoin = async () => {
     const code = joinCode.trim().toUpperCase();
     if (!code) { pushToast("Entrez le code d'invitation", "error"); return; }
-    const match = (shops || []).find((s) => s.joinCode === code);
-    if (match) { onJoinShop(match.id); return; }
-    pushToast("Aucune boutique trouvée avec ce code sur cet appareil. La synchronisation multi-appareils nécessite une connexion au serveur.", "error");
+    setLoading(true);
+    try {
+      const backend = await api.joinShopBackend({ joinCode: code });
+      const pulled = await api.pullAll();
+      const meta = pulled.shopMeta || {};
+      const shopObj = {
+        id: backend.shop_id,
+        name: meta.name || backend.name,
+        type: meta.type || backend.type,
+        currency: meta.currency || backend.currency,
+        adminPinHash: meta.adminPinHash,
+        theme: meta.theme, darkMode: meta.darkMode, soundsEnabled: meta.soundsEnabled,
+        loyaltyThreshold: meta.loyaltyThreshold, language: meta.language,
+        joinCode: code,
+        backendLinked: true,
+      };
+      onJoinShop(shopObj, pulled);
+    } catch (e) {
+      pushToast(e.message === "OFFLINE" ? "Connexion internet requise pour rejoindre une boutique." : (e.message || "Code introuvable"), "error");
+    } finally {
+      setLoading(false);
+    }
   };
 
   if (mode === null) {
@@ -573,11 +606,11 @@ function OnboardingScreen({ shops, onComplete, onJoinShop, pushToast }) {
           className="gb-focus w-full max-w-xs rounded-2xl px-4 py-3.5 text-lg font-mono text-center tracking-wider outline-none mb-4"
           style={{ background: "var(--glass-light)", color: "#fff" }}
         />
-        <button onClick={submitJoin} className="gb-focus w-full max-w-xs rounded-2xl py-3 font-semibold text-sm active:scale-[0.98] transition-transform" style={{ background: "var(--cap)", color: "var(--glass)" }}>
-          Rejoindre
+        <button onClick={submitJoin} disabled={loading} className="gb-focus w-full max-w-xs rounded-2xl py-3 font-semibold text-sm active:scale-[0.98] transition-transform disabled:opacity-50" style={{ background: "var(--cap)", color: "var(--glass)" }}>
+          {loading ? "Connexion…" : "Rejoindre"}
         </button>
         <button onClick={() => setMode(null)} className="gb-focus mt-6 text-white/50 text-xs underline">Retour</button>
-        <p className="text-white/30 text-[11px] text-center mt-8 max-w-[260px]">Fonctionne dès aujourd'hui entre boutiques déjà connues de cet appareil ; la synchronisation entre appareils différents arrive avec la connexion au serveur.</p>
+        <p className="text-white/30 text-[11px] text-center mt-8 max-w-[260px]">Une connexion internet est nécessaire pour rejoindre une boutique existante. Une fois connecté, l'app fonctionne aussi hors-ligne au quotidien.</p>
       </div>
     );
   }
@@ -621,14 +654,15 @@ function OnboardingScreen({ shops, onComplete, onJoinShop, pushToast }) {
                 {currency === c.code && <Check size={16} color="var(--glass)" />}
               </button>
             ))}
+            <p className="text-white/30 text-[11px] text-center mt-3">Une connexion internet est nécessaire pour cette dernière étape (création sur le serveur). L'app fonctionnera ensuite hors-ligne au quotidien.</p>
           </div>
         )}
       </div>
 
       <div className="w-full max-w-xs flex items-center gap-3 mt-8">
         {step > 1 && <button onClick={() => setStep(step - 1)} className="gb-focus px-4 py-3 rounded-2xl text-white/60 text-sm">Retour</button>}
-        <button onClick={next} className="gb-focus flex-1 rounded-2xl py-3 font-semibold text-sm active:scale-[0.98] transition-transform" style={{ background: "var(--cap)", color: "var(--glass)" }}>
-          {step < 3 ? "Continuer" : "Terminer la configuration"}
+        <button onClick={next} disabled={loading} className="gb-focus flex-1 rounded-2xl py-3 font-semibold text-sm active:scale-[0.98] transition-transform disabled:opacity-50" style={{ background: "var(--cap)", color: "var(--glass)" }}>
+          {loading ? "Création…" : step < 3 ? "Continuer" : "Terminer la configuration"}
         </button>
       </div>
       <div className="flex gap-1.5 mt-6">
@@ -678,10 +712,11 @@ function LoginScreen({ shop, shops, activeShopId, onSwitchShop, vendors, onLogin
   const typeLabel = ESTABLISHMENT_TYPES.find((t) => t.id === shop.type)?.label || "";
   const check = (pin) => {
     if (mode === "admin") {
-      if (pin === (shop.adminPin || DEFAULT_ADMIN_PIN)) { onLogin("admin", "Administrateur"); return true; }
+      const valid = shop.backendLinked ? api.verifyPin(pin, shop.adminPinHash) : pin === (shop.adminPin || DEFAULT_ADMIN_PIN);
+      if (valid) { onLogin("admin", "Administrateur"); return true; }
       pushToast("Code incorrect", "error"); return false;
     }
-    const v = vendors.find((x) => x.pin === pin);
+    const v = vendors.find((x) => (shop.backendLinked ? api.verifyPin(pin, x.pinHash) : x.pin === pin));
     if (v) { onLogin("vendeur", v.name); return true; }
     pushToast("Code incorrect", "error"); return false;
   };
@@ -721,7 +756,7 @@ function LoginScreen({ shop, shops, activeShopId, onSwitchShop, vendors, onLogin
             <ShieldCheck size={20} color="var(--cap)" />
             <div><div className="text-white font-semibold text-sm">{(TRANSLATIONS[shop.language || "fr"] || TRANSLATIONS.fr).administrator}</div><div className="text-white/50 text-xs">Stock, prix, rapports</div></div>
           </button>
-          {(!shop.adminPin || shop.adminPin === DEFAULT_ADMIN_PIN) && (
+          {((!shop.backendLinked && (!shop.adminPin || shop.adminPin === DEFAULT_ADMIN_PIN)) || (shop.backendLinked && api.verifyPin(DEFAULT_ADMIN_PIN, shop.adminPinHash))) && (
             <p className="text-white/30 text-[11px] text-center mt-3 font-mono">Code administrateur par défaut : 1234</p>
           )}
         </div>
@@ -1615,21 +1650,36 @@ function ExpenseForm({ onSave, onCancel, suppliers }) {
   );
 }
 
-function VendorForm({ initial, onSave, onCancel, pushToast, vendors, adminPin }) {
-  const [f, setF] = useState(initial || { name: "", pin: "" });
+function VendorForm({ initial, onSave, onCancel, pushToast, vendors, adminPin, adminPinHash, backendLinked }) {
+  const [f, setF] = useState(initial ? { ...initial, pin: "" } : { name: "", pin: "" });
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
+  const isEdit = !!initial;
   return (
     <div className="rounded-2xl border p-4 mb-3 gb-slide-up" style={{ borderColor: "var(--line)", background: "var(--card)" }}>
       <div className="flex flex-col gap-2.5">
         <input className="gb-focus rounded-xl px-3 py-2 text-sm border" style={{ borderColor: "var(--line)" }} placeholder="Nom du vendeur" value={f.name} onChange={(e) => set("name", e.target.value)} />
-        <input className="gb-focus rounded-xl px-3 py-2 text-sm border font-mono" style={{ borderColor: "var(--line)" }} placeholder="Code PIN (4 chiffres)" maxLength={4} value={f.pin} onChange={(e) => set("pin", e.target.value.replace(/\D/g, ""))} />
+        <input className="gb-focus rounded-xl px-3 py-2 text-sm border font-mono" style={{ borderColor: "var(--line)" }} placeholder={backendLinked && isEdit ? "Nouveau PIN (laisser vide = inchangé)" : "Code PIN (4 chiffres)"} maxLength={4} value={f.pin} onChange={(e) => set("pin", e.target.value.replace(/\D/g, ""))} />
       </div>
       <div className="flex gap-2 mt-3">
         <button onClick={onCancel} className="gb-focus flex-1 rounded-xl py-2.5 text-sm font-semibold" style={{ background: "var(--paper-dim)" }}>Annuler</button>
         <button onClick={() => {
-          if (!f.name || f.pin.length !== 4) { pushToast("Nom et PIN à 4 chiffres requis", "error"); return; }
-          if (f.pin === (adminPin || DEFAULT_ADMIN_PIN) || vendors.some((v) => v.pin === f.pin && v.id !== f.id)) { pushToast("Ce code PIN est déjà utilisé", "error"); return; }
-          onSave({ id: f.id || uid(), name: f.name, pin: f.pin });
+          if (!f.name) { pushToast("Nom requis", "error"); return; }
+          const pinProvided = f.pin.length === 4;
+          const keepExistingPin = backendLinked && isEdit && f.pin.length === 0;
+          if (!pinProvided && !keepExistingPin) { pushToast("PIN à 4 chiffres requis", "error"); return; }
+          if (pinProvided) {
+            const duplicate = backendLinked
+              ? api.verifyPin(f.pin, adminPinHash) || vendors.some((v) => v.id !== f.id && api.verifyPin(f.pin, v.pinHash))
+              : f.pin === (adminPin || DEFAULT_ADMIN_PIN) || vendors.some((v) => v.pin === f.pin && v.id !== f.id);
+            if (duplicate) { pushToast("Ce code PIN est déjà utilisé", "error"); return; }
+          }
+          const record = { id: f.id || uid(), name: f.name, phone: f.phone };
+          if (backendLinked) {
+            record.pinHash = pinProvided ? api.hashPin(f.pin) : initial?.pinHash;
+          } else {
+            record.pin = f.pin;
+          }
+          onSave(record);
         }} className="gb-focus flex-1 rounded-xl py-2.5 text-sm font-semibold text-white" style={{ background: "var(--glass)" }}>Enregistrer</button>
       </div>
     </div>
@@ -2630,7 +2680,7 @@ function ExpensesSection({ expenses, saveExpenses, suppliers }) {
   );
 }
 
-function VendorsSection({ vendors, saveVendors, pushToast, adminPin }) {
+function VendorsSection({ vendors, saveVendors, pushToast, adminPin, adminPinHash, backendLinked }) {
   const [editing, setEditing] = useState(null);
   const [adding, setAdding] = useState(false);
   const upsert = (v) => { const exists = vendors.some((x) => x.id === v.id); saveVendors(exists ? vendors.map((x) => (x.id === v.id ? v : x)) : [...vendors, v]); setEditing(null); setAdding(false); };
@@ -2641,10 +2691,10 @@ function VendorsSection({ vendors, saveVendors, pushToast, adminPin }) {
         <h3 className="font-display font-bold text-base">Vendeurs ({vendors.length})</h3>
         <button onClick={() => { setAdding(true); setEditing(null); }} className="gb-focus flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full text-white" style={{ background: "var(--glass)" }}><Plus size={14} /> Ajouter</button>
       </div>
-      {adding && <VendorForm onSave={upsert} onCancel={() => setAdding(false)} pushToast={pushToast} vendors={vendors} adminPin={adminPin} />}
+      {adding && <VendorForm onSave={upsert} onCancel={() => setAdding(false)} pushToast={pushToast} vendors={vendors} adminPin={adminPin} adminPinHash={adminPinHash} backendLinked={backendLinked} />}
       <div className="flex flex-col gap-2.5">
         {vendors.map((v) => editing === v.id ? (
-          <VendorForm key={v.id} initial={v} onSave={upsert} onCancel={() => setEditing(null)} pushToast={pushToast} vendors={vendors} adminPin={adminPin} />
+          <VendorForm key={v.id} initial={v} onSave={upsert} onCancel={() => setEditing(null)} pushToast={pushToast} vendors={vendors} adminPin={adminPin} adminPinHash={adminPinHash} backendLinked={backendLinked} />
         ) : (
           <div key={v.id} className="rounded-2xl p-3 flex items-center gap-3 border" style={{ borderColor: "var(--line)", background: "var(--card)" }}>
             <div className="w-9 h-9 rounded-full flex items-center justify-center shrink-0" style={{ background: "var(--paper-dim)" }}><Users size={16} /></div>
@@ -2883,12 +2933,12 @@ function SecuritySection({ shop, saveShopMeta, pushToast }) {
   const [confirm, setConfirm] = useState("");
 
   const submit = () => {
-    const actual = shop.adminPin || DEFAULT_ADMIN_PIN;
-    if (current !== actual) { pushToast("Code actuel incorrect", "error"); return; }
+    const valid = shop.backendLinked ? api.verifyPin(current, shop.adminPinHash) : current === (shop.adminPin || DEFAULT_ADMIN_PIN);
+    if (!valid) { pushToast("Code actuel incorrect", "error"); return; }
     if (next.length !== 4) { pushToast("Le nouveau code doit contenir 4 chiffres", "error"); return; }
     if (next !== confirm) { pushToast("Les deux codes ne correspondent pas", "error"); return; }
     if (next === current) { pushToast("Choisissez un code différent de l'ancien", "error"); return; }
-    saveShopMeta({ ...shop, adminPin: next });
+    saveShopMeta(shop.backendLinked ? { ...shop, adminPinHash: api.hashPin(next) } : { ...shop, adminPin: next });
     pushToast("Code administrateur mis à jour", "ok");
     setCurrent(""); setNext(""); setConfirm("");
   };
@@ -3122,7 +3172,7 @@ function AdminScreen({
       {section === "categories" && <CategoriesSection categories={categories} saveCategories={saveCategories} products={products} pushToast={pushToast} />}
       {section === "fournisseurs" && <SuppliersSection suppliers={suppliers} saveSuppliers={saveSuppliers} expenses={expenses} products={products} />}
       {section === "depenses" && <ExpensesSection expenses={expenses} saveExpenses={saveExpenses} suppliers={suppliers} />}
-      {section === "vendeurs" && <VendorsSection vendors={vendors} saveVendors={saveVendors} pushToast={pushToast} adminPin={shop.adminPin} />}
+      {section === "vendeurs" && <VendorsSection vendors={vendors} saveVendors={saveVendors} pushToast={pushToast} adminPin={shop.adminPin} adminPinHash={shop.adminPinHash} backendLinked={shop.backendLinked} />}
       {section === "clients" && <ClientsSection clients={clients} saveClients={saveClients} sales={sales} shop={shop} pushToast={pushToast} />}
       {section === "donnees" && (
         <DataSection
@@ -3226,6 +3276,7 @@ export default function App() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [notifPanelOpen, setNotifPanelOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [pendingSync, setPendingSync] = useState(0);
   const [license, setLicense] = useState(undefined); // undefined = chargement, null = jamais activée
   const [trialUsed, setTrialUsed] = useState(false);
   const [ownerAccess, setOwnerAccess] = useState(null); // null = non vérifié, string (email) = vérifié
@@ -3307,30 +3358,64 @@ export default function App() {
   const shop = shops && activeShopId ? shops.find((s) => s.id === activeShopId) : null;
 
   const pushToast = (message, type = "ok") => { setToast({ message, type }); setTimeout(() => setToast(null), 2200); };
-  const saveProducts = (next) => { setProducts(next); window.storage.set(`products:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
-  const saveSales = (next) => { setSales(next); window.storage.set(`sales:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
-  const saveVendors = (next) => { setVendors(next); window.storage.set(`vendors:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
-  const saveSuppliers = (next) => { setSuppliers(next); window.storage.set(`suppliers:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
-  const saveExpenses = (next) => { setExpenses(next); window.storage.set(`expenses:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
-  const saveCategories = (next) => { setCategories(next); window.storage.set(`categories:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); pushToast("Catégories mises à jour", "ok"); };
-  const saveMovements = (next) => { setMovements(next); window.storage.set(`movements:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
-  const saveClients = (next) => { setClients(next); window.storage.set(`clients:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
+
+  const getLocalValue = (key) => {
+    switch (key) {
+      case "shopMeta": return shop ? { name: shop.name, type: shop.type, currency: shop.currency, adminPinHash: shop.adminPinHash, theme: shop.theme, darkMode: shop.darkMode, soundsEnabled: shop.soundsEnabled, loyaltyThreshold: shop.loyaltyThreshold, language: shop.language } : {};
+      case "vendors": return vendors;
+      case "products": return products;
+      case "sales": return sales;
+      case "categories": return categories;
+      case "suppliers": return suppliers;
+      case "expenses": return expenses;
+      case "movements": return movements;
+      case "inventories": return inventories;
+      case "clients": return clients;
+      default: return null;
+    }
+  };
+  const trySync = () => {
+    if (shop?.backendLinked) {
+      api.flushSyncQueue(getLocalValue).then(() => setPendingSync(api.getPendingCount())).catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    if (!shop?.backendLinked) return;
+    setPendingSync(api.getPendingCount());
+    trySync();
+    const onOnline = () => trySync();
+    window.addEventListener("online", onOnline);
+    const interval = setInterval(trySync, 25000);
+    return () => { window.removeEventListener("online", onOnline); clearInterval(interval); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shop?.backendLinked, activeShopId]);
+
+  const saveProducts = (next) => { setProducts(next); window.storage.set(`products:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("products"); setPendingSync(api.getPendingCount()); trySync(); } };
+  const saveSales = (next) => { setSales(next); window.storage.set(`sales:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("sales"); setPendingSync(api.getPendingCount()); trySync(); } };
+  const saveVendors = (next) => { setVendors(next); window.storage.set(`vendors:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("vendors"); setPendingSync(api.getPendingCount()); trySync(); } };
+  const saveSuppliers = (next) => { setSuppliers(next); window.storage.set(`suppliers:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("suppliers"); setPendingSync(api.getPendingCount()); trySync(); } };
+  const saveExpenses = (next) => { setExpenses(next); window.storage.set(`expenses:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("expenses"); setPendingSync(api.getPendingCount()); trySync(); } };
+  const saveCategories = (next) => { setCategories(next); window.storage.set(`categories:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("categories"); setPendingSync(api.getPendingCount()); trySync(); } pushToast("Catégories mises à jour", "ok"); };
+  const saveMovements = (next) => { setMovements(next); window.storage.set(`movements:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("movements"); setPendingSync(api.getPendingCount()); trySync(); } };
+  const saveClients = (next) => { setClients(next); window.storage.set(`clients:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("clients"); setPendingSync(api.getPendingCount()); trySync(); } };
   const onCreateClient = (name) => {
     const newClient = { id: uid(), name, phone: "", notes: "", loyaltyRedeemed: 0 };
     saveClients([...clients, newClient]);
     return newClient.id;
   };
-  const saveInventories = (next) => { setInventories(next); window.storage.set(`inventories:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); };
+  const saveInventories = (next) => { setInventories(next); window.storage.set(`inventories:${activeShopId}`, JSON.stringify(next)).catch(() => pushToast("Erreur de sauvegarde", "error")); if (shop?.backendLinked) { api.markDirty("inventories"); setPendingSync(api.getPendingCount()); trySync(); } };
 
   const saveShopMeta = (next) => {
     const nextShops = shops.map((s) => (s.id === activeShopId ? next : s));
     setShops(nextShops);
     window.storage.set("shops", JSON.stringify(nextShops)).catch(() => pushToast("Erreur de sauvegarde", "error"));
+    if (next.backendLinked) { api.markDirty("shopMeta"); setPendingSync(api.getPendingCount()); setTimeout(trySync, 0); }
     pushToast("Boutique mise à jour", "ok");
   };
 
   const handleOnboardingComplete = async (shopMeta, vendor) => {
-    const newShop = { id: uid(), salesNotificationsEnabled: true, theme: "emeraude", darkMode: false, soundsEnabled: true, adminPin: DEFAULT_ADMIN_PIN, ...shopMeta };
+    const newShop = { salesNotificationsEnabled: true, theme: "emeraude", darkMode: false, soundsEnabled: true, ...shopMeta };
     const nextShops = [newShop];
     setShops(nextShops);
     window.storage.set("shops", JSON.stringify(nextShops)).catch(() => {});
@@ -3338,7 +3423,42 @@ export default function App() {
     await seedShopData(newShop.id, vendor);
     setActiveShopId(newShop.id);
     setProducts(SEED_PRODUCTS); setSales([]); setVendors([vendor]); setSuppliers(SEED_SUPPLIERS); setExpenses([]); setCategories(SEED_CATEGORIES); setMovements([]); setInventories([]); setClients([]);
+    if (newShop.backendLinked) {
+      ["shopMeta", "vendors", "products", "sales", "categories", "suppliers", "expenses", "movements", "inventories", "clients"].forEach(api.markDirty);
+    }
     pushToast(`Bienvenue, ${newShop.name} !`, "ok");
+  };
+
+  const handleJoinShopComplete = async (shopObj, pulled) => {
+    const newShop = { salesNotificationsEnabled: true, theme: "emeraude", darkMode: false, soundsEnabled: true, ...shopObj };
+    const nextShops = [...shops, newShop];
+    const products = pulled.products || SEED_PRODUCTS;
+    const salesData = pulled.sales || [];
+    const vendorsData = pulled.vendors || [];
+    const categoriesData = pulled.categories || SEED_CATEGORIES;
+    const suppliersData = pulled.suppliers || SEED_SUPPLIERS;
+    const expensesData = pulled.expenses || [];
+    const movementsData = pulled.movements || [];
+    const inventoriesData = pulled.inventories || [];
+    const clientsData = pulled.clients || [];
+    setShops(nextShops);
+    window.storage.set("shops", JSON.stringify(nextShops)).catch(() => {});
+    window.storage.set("activeShopId", JSON.stringify(newShop.id)).catch(() => {});
+    await Promise.all([
+      window.storage.set(`products:${newShop.id}`, JSON.stringify(products)),
+      window.storage.set(`sales:${newShop.id}`, JSON.stringify(salesData)),
+      window.storage.set(`vendors:${newShop.id}`, JSON.stringify(vendorsData)),
+      window.storage.set(`categories:${newShop.id}`, JSON.stringify(categoriesData)),
+      window.storage.set(`suppliers:${newShop.id}`, JSON.stringify(suppliersData)),
+      window.storage.set(`expenses:${newShop.id}`, JSON.stringify(expensesData)),
+      window.storage.set(`movements:${newShop.id}`, JSON.stringify(movementsData)),
+      window.storage.set(`inventories:${newShop.id}`, JSON.stringify(inventoriesData)),
+      window.storage.set(`clients:${newShop.id}`, JSON.stringify(clientsData)),
+    ]).catch(() => {});
+    setActiveShopId(newShop.id);
+    setProducts(products); setSales(salesData); setVendors(vendorsData); setSuppliers(suppliersData);
+    setExpenses(expensesData); setCategories(categoriesData); setMovements(movementsData); setInventories(inventoriesData); setClients(clientsData);
+    pushToast(`Connecté à "${newShop.name}" !`, "ok");
   };
 
   const handleCreateShop = async (newShop, vendor) => {
@@ -3487,7 +3607,7 @@ export default function App() {
           <ActivationScreen onActivate={handleActivateLicense} onStartTrial={handleStartTrial} trialUsed={trialUsed} pushToast={pushToast} />
         )}
 
-        {licenseStatus !== "none" && shops.length === 0 && <OnboardingScreen shops={shops} onComplete={handleOnboardingComplete} onJoinShop={handleSwitchShop} pushToast={pushToast} />}
+        {licenseStatus !== "none" && shops.length === 0 && <OnboardingScreen shops={shops} onComplete={handleOnboardingComplete} onJoinShop={handleJoinShopComplete} pushToast={pushToast} />}
 
         {licenseStatus !== "none" && shops.length > 0 && shop && (
           <CurrencyContext.Provider value={shop.currency}>
@@ -3499,7 +3619,14 @@ export default function App() {
                 <div className="px-4 pt-4 pb-2 flex items-center justify-between sticky top-0 z-20 no-print" style={{ background: "var(--paper)" }}>
                   <div>
                     <p className="font-display font-bold text-base leading-none">{shop.name}</p>
-                    <p className="text-[11px] opacity-50 mt-0.5">{currentVendorName}</p>
+                    <p className="text-[11px] opacity-50 mt-0.5 flex items-center gap-1.5">
+                      {currentVendorName}
+                      {shop.backendLinked && pendingSync > 0 && (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-semibold" style={{ background: "var(--cap)", color: "var(--glass)" }} title="En attente de synchronisation">
+                          ⏳ {pendingSync}
+                        </span>
+                      )}
+                    </p>
                   </div>
                   <div className="flex items-center gap-2">
                     <button onClick={() => setGlobalSearchOpen(true)} className="gb-focus w-9 h-9 rounded-full flex items-center justify-center" style={{ background: "var(--paper-dim)" }} aria-label="Recherche globale">
